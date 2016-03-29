@@ -3,7 +3,6 @@ use serde;
 use std::fmt;
 use std::io::Write;
 
-use rmp::Marker;
 use rmp::encode::{
     write_nil,
     write_bool,
@@ -84,29 +83,8 @@ impl serde::ser::Error for Error {
     }
 }
 
-pub trait VariantWriter {
-    fn write_struct_len<W>(&self, wr: &mut W, len: u32) -> Result<Marker, ValueWriteError> where W: Write;
-    fn write_field_name<W>(&self, wr: &mut W, _key: &str) -> Result<(), ValueWriteError> where W: Write;
-}
 
-/// Writes struct as MessagePack array with no field names
-pub struct StructArrayWriter;
 
-impl VariantWriter for StructArrayWriter {
-    fn write_struct_len<W>(&self, wr: &mut W, len: u32) -> Result<Marker, ValueWriteError>
-        where W: Write
-    {
-        write_array_len(wr, len)
-    }
-
-    /// This implementation does not write field names
-    #[allow(unused_variables)]
-    fn write_field_name<W>(&self, wr: &mut W, _key: &str) -> Result<(), ValueWriteError>
-        where W: Write
-    {
-        Ok(())
-    }
-}
 
 /// Represents MessagePack serialization implementation.
 ///
@@ -120,13 +98,12 @@ impl VariantWriter for StructArrayWriter {
 /// All instances of `ErrorKind::Interrupted` are handled by this function and the underlying
 /// operation is retried.
 // TODO: Docs. Examples.
-pub struct Serializer<'a, W: VariantWriter> {
+pub struct Serializer<'a> {
     wr: &'a mut Write,
-    vw: W,
     depth: usize,
 }
 
-impl<'a, W: VariantWriter> Serializer<'a, W> {
+impl<'a> Serializer<'a> {
     /// Changes the maximum nesting depth that is allowed
     pub fn set_max_depth(&mut self, depth: usize) {
         self.depth = depth;
@@ -147,29 +124,27 @@ macro_rules! depth_count(
     }
 );
 
-impl<'a> Serializer<'a, StructArrayWriter> {
+impl<'a> Serializer<'a> {
     /// Creates a new MessagePack encoder whose output will be written to the writer specified.
-    pub fn new(wr: &'a mut Write) -> Serializer<'a, StructArrayWriter> {
+    pub fn new(wr: &'a mut Write) -> Serializer<'a> {
         Serializer {
             wr: wr,
-            vw: StructArrayWriter,
             depth: 1000,
         }
     }
 }
 
-impl<'a, W: VariantWriter> Serializer<'a, W> {
+impl<'a> Serializer<'a> {
     /// Creates a new MessagePack encoder whose output will be written to the writer specified.
-    pub fn with(wr: &'a mut Write, vw: W) -> Serializer<'a, W> {
+    pub fn with(wr: &'a mut Write) -> Serializer<'a> {
         Serializer {
             wr: wr,
-            vw: vw,
             depth: 1000,
         }
     }
 }
 
-impl<'a, W: VariantWriter> serde::Serializer for Serializer<'a, W> {
+impl<'a> serde::Serializer for Serializer<'a> {
     type Error = Error;
 
     fn serialize_unit(&mut self) -> Result<(), Error> {
@@ -291,12 +266,28 @@ impl<'a, W: VariantWriter> serde::Serializer for Serializer<'a, W> {
 
     fn serialize_struct_variant<V>(&mut self,
                                _name: &str,
-                               _variant_index: usize,
+                               variant_index: usize,
                                _variant: &str,
-                               _visitor: V) -> Result<(), Error>
+                               mut visitor: V) -> Result<(), Error>
         where V: serde::ser::MapVisitor,
     {
-        unimplemented!()
+        // Mark that we want to encode a variant type.
+        try!(write_array_len(&mut self.wr, 2));
+
+        // Encode a value position...
+        try!(self.serialize_usize(variant_index));
+
+        let len = match visitor.len() {
+            Some(len) => len,
+            None => return Err(Error::UnknownLength),
+        };
+
+        // ... and its map length.
+        try!(write_map_len(&mut self.wr, len as u32));
+
+        while let Some(()) = try!(depth_count!(self.depth, visitor.visit(self))) { }
+
+        Ok(())
     }
 
     fn serialize_none(&mut self) -> Result<(), Error> {
@@ -355,32 +346,32 @@ impl<'a, W: VariantWriter> serde::Serializer for Serializer<'a, W> {
     }
 
     fn serialize_unit_struct(&mut self, _name: &'static str) -> Result<(), Error> {
-        try!(write_array_len(&mut self.wr, 0));
+        try!(write_map_len(&mut self.wr, 0));
 
         Ok(())
     }
 
-    fn serialize_struct<V>(&mut self, _name: &str, mut visitor: V) -> Result<(), Error>
-        where V: serde::ser::MapVisitor,
-    {
-        let len = match visitor.len() {
-            Some(len) => len,
-            None => return Err(Error::UnknownLength),
-        };
+    // fn serialize_struct<V>(&mut self, _name: &str, mut visitor: V) -> Result<(), Error>
+    //     where V: serde::ser::MapVisitor,
+    // {
+    //     let len = match visitor.len() {
+    //         Some(len) => len,
+    //         None => return Err(Error::UnknownLength),
+    //     };
+    //
+    //     try!(self.vw.write_struct_len(&mut self.wr, len as u32));
+    //
+    //     while let Some(()) = try!(depth_count!(self.depth, visitor.visit(self))) { }
+    //
+    //     Ok(())
+    // }
 
-        try!(self.vw.write_struct_len(&mut self.wr, len as u32));
-
-        while let Some(()) = try!(depth_count!(self.depth, visitor.visit(self))) { }
-
-        Ok(())
-    }
-
-    fn serialize_struct_elt<V>(&mut self, _key: &str, value: V) -> Result<(), Error>
-        where V: serde::Serialize,
-    {
-        try!(self.vw.write_field_name(&mut self.wr, _key));
-        value.serialize(self)
-    }
+    // fn serialize_struct_elt<V>(&mut self, _key: &str, value: V) -> Result<(), Error>
+    //     where V: serde::Serialize,
+    // {
+    //     try!(self.vw.write_field_name(&mut self.wr, _key));
+    //     value.serialize(self)
+    // }
 
     fn serialize_bytes(&mut self, value: &[u8]) -> Result<(), Error> {
         try!(write_bin_len(&mut self.wr, value.len() as u32));
